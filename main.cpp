@@ -270,9 +270,9 @@ int main(int argc, char *argv[])
 
         const uint8_t *payload = packet + sizeof(EthHdr) + ihl + thl;
         // debug: check first bytes
-        printf("[DEBUG] payload %u bytes -> first 5 bytes = %02X %02X %02X %02X %02X\n",
-               dataLen,
-               payload[0], payload[1], payload[2], payload[3], payload[4]);
+        // printf("[DEBUG] payload %u bytes -> first 5 bytes = %02X %02X %02X %02X %02X\n",
+        //        dataLen,
+        //        payload[0], payload[1], payload[2], payload[3], payload[4]);
 
         std::string sni;
         if (!parseTlsSni(payload, dataLen, sni))
