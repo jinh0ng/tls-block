@@ -1,3 +1,5 @@
+// main.cpp for tls-block
+
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -9,12 +11,40 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <string>
+#include <iostream>
 
 #include "ethhdr.h"
 #include "iphdr.h"
 #include "tcphdr.h"
-#include "ip.h"
 
+using std::string;
+
+// error 출력 및 사용법
+void usage()
+{
+    printf("syntax : tls-block <interface> <server name>\n");
+    printf("sample : tls-block wlan0 example.com\n");
+}
+
+// 인터페이스 MAC/IP 조회용 구조체
+typedef struct
+{
+    Mac mac;
+    Ip ip;
+} t_info;
+t_info MyInfo;
+
+// pcap_capture → raw socket 전송 시 사용할 IP 레벨 유사헤더
+typedef struct
+{
+    uint32_t srcAddr;
+    uint32_t dstAddr;
+    uint8_t reserved;
+    uint8_t proto;
+    uint16_t tcpLen;
+} ChecksumHdr;
+
+// IPv4/TCP 헤더 + Ethernet 헤더 간편 구조
 #pragma pack(push, 1)
 struct PacketInfo
 {
@@ -24,53 +54,47 @@ struct PacketInfo
 };
 #pragma pack(pop)
 
-#pragma pack(push, 1)
-struct ChecksumHdr
+// IP/TCP checksum 계산 (tcp-block 코드 재사용)
+uint16_t CheckSum(uint16_t *buffer, int size)
 {
-    uint32_t srcAddr;
-    uint32_t dstAddr;
-    uint8_t reserved;
-    uint8_t proto;
-    uint16_t tcpLen;
-};
-#pragma pack(pop)
-
-typedef struct
-{
-    Mac mac;
-    Ip ip;
-} t_info;
-
-t_info MyInfo;
-
-void usage()
-{
-    printf("syntax : tls-block <interface> <server name>\n");
-    printf("sample : tls-block wlan0 naver.com\n");
+    uint32_t csum = 0;
+    while (size > 1)
+    {
+        csum += *buffer++;
+        size -= 2;
+    }
+    if (size)
+    {
+        csum += *(uint8_t *)buffer;
+    }
+    while (csum >> 16)
+    {
+        csum = (csum & 0xFFFF) + (csum >> 16);
+    }
+    return (uint16_t)(~csum);
 }
 
+// 내 MAC/IP 가져오기 (tcp-block 코드 재사용)
 int getMyInfo(t_info *info, const char *dev)
 {
     struct ifreq ifr;
     int fd = socket(PF_INET, SOCK_DGRAM, 0);
     if (fd < 0)
         return -1;
-
     strncpy(ifr.ifr_name, dev, IFNAMSIZ - 1);
     ifr.ifr_name[IFNAMSIZ - 1] = '\0';
 
-    // MAC address
+    // MAC
     if (ioctl(fd, SIOCGIFHWADDR, &ifr) == 0)
     {
-        info->mac = Mac(reinterpret_cast<uint8_t *>(ifr.ifr_hwaddr.sa_data));
+        info->mac = Mac((uint8_t *)ifr.ifr_hwaddr.sa_data);
     }
     else
     {
         close(fd);
         return -1;
     }
-
-    // IP address
+    // IP
     if (ioctl(fd, SIOCGIFADDR, &ifr) == 0)
     {
         uint32_t raw = ntohl(((struct sockaddr_in *)&ifr.ifr_addr)->sin_addr.s_addr);
@@ -81,111 +105,86 @@ int getMyInfo(t_info *info, const char *dev)
         close(fd);
         return -1;
     }
-
-    printf("My MAC: %s\n", std::string(info->mac).c_str());
-    printf("My IP: %s\n", std::string(info->ip).c_str());
     close(fd);
+    std::cout << "My MAC: " << std::string(info->mac) << "\n";
+    std::cout << "My IP : " << std::string(info->ip) << "\n";
     return 0;
 }
 
-uint16_t CheckSum(uint16_t *buf, int size)
+// TCP payload에서 TLS ClientHello SNI를 파싱해 반환 (매칭 실패 시 빈 문자열)
+string parse_sni(const uint8_t *data, int len)
 {
-    uint32_t sum = 0;
-    while (size > 1)
-    {
-        sum += *buf++;
-        size -= 2;
-    }
-    if (size > 0)
-        sum += *(uint8_t *)buf;
-    while (sum >> 16)
-        sum = (sum & 0xFFFF) + (sum >> 16);
-    return (uint16_t)(~sum);
-}
-
-bool parseTlsSni(const uint8_t *data, uint32_t len, std::string &sni)
-{
+    int pos = 0;
     if (len < 5)
-        return false;
-    uint32_t pos = 0;
-
-    // TLS Record Header
-    uint8_t type = data[pos++];
-    if (type != 22)
-        return false; // Handshake
-    pos += 2;         // version
-    uint16_t recLen = (data[pos] << 8) | data[pos + 1];
+        return "";
+    uint8_t content_type = data[pos++];
+    if (content_type != 0x16)
+        return ""; // Handshake
+    pos += 2;      // 버전
+    uint16_t rec_len = ntohs(*(uint16_t *)(data + pos));
     pos += 2;
-    if (recLen + 5 > len)
-        return false;
-
-    // Handshake Message
-    if (data[pos++] != 1)
-        return false; // ClientHello
-    uint32_t hsLen = (data[pos] << 16) | (data[pos + 1] << 8) | data[pos + 2];
+    if (rec_len + 5 > (uint16_t)len)
+        return "";
+    // Handshake 메시지
+    if (pos + 4 > len)
+        return "";
+    uint8_t hs_type = data[pos++];
+    if (hs_type != 0x01)
+        return ""; // ClientHello
+    uint32_t hs_len = ((data[pos] << 16) | (data[pos + 1] << 8) | data[pos + 2]);
     pos += 3;
-    if (hsLen + 4 > recLen)
-        return false;
-
-    // skip version(2) + random(32)
+    if (pos + hs_len > len)
+        return "";
+    // 버전(2) + 랜덤(32)
     pos += 2 + 32;
     if (pos + 1 > len)
-        return false;
-
-    // session ID
-    uint8_t sidLen = data[pos++];
-    pos += sidLen;
+        return "";
+    // SessionID
+    uint8_t sid_len = data[pos++];
+    pos += sid_len;
     if (pos + 2 > len)
-        return false;
-
-    // cipher suites
-    uint16_t csLen = (data[pos] << 8) | data[pos + 1];
-    pos += 2 + csLen;
+        return "";
+    // CipherSuites
+    uint16_t cs_len = (data[pos] << 8) | (data[pos + 1]);
+    pos += 2 + cs_len;
     if (pos + 1 > len)
-        return false;
-
-    // compression methods
-    uint8_t compLen = data[pos++];
-    pos += compLen;
+        return "";
+    // CompressionMethods
+    uint8_t cm_len = data[pos++];
+    pos += cm_len;
     if (pos + 2 > len)
-        return false;
-
-    // extensions
-    uint16_t extLen = (data[pos] << 8) | data[pos + 1];
+        return "";
+    // Extensions 전체 길이
+    uint16_t ext_tot = (data[pos] << 8) | (data[pos + 1]);
     pos += 2;
-    uint32_t extEnd = pos + extLen;
-
-    while (pos + 4 <= extEnd)
+    int ext_end = pos + ext_tot;
+    // Extensions 순회
+    while (pos + 4 <= ext_end && pos + 4 <= len)
     {
-        uint16_t extType = (data[pos] << 8) | data[pos + 1];
-        uint16_t extSize = (data[pos + 2] << 8) | data[pos + 3];
-        pos += 4;
-        if (extType == 0x0000)
-        { // SNI
+        uint16_t ext_type = (data[pos] << 8) | (data[pos + 1]);
+        pos += 2;
+        uint16_t ext_len = (data[pos] << 8) | (data[pos + 1]);
+        pos += 2;
+        if (ext_type == 0x0000)
+        { // server_name
             if (pos + 2 > len)
-                return false;
-            uint16_t listLen = (data[pos] << 8) | data[pos + 1];
+                return "";
+            uint16_t list_len = (data[pos] << 8) | (data[pos + 1]);
             pos += 2;
-            uint32_t listEnd = pos + listLen;
-            while (pos + 3 <= listEnd)
+            int list_end = pos + list_len;
+            while (pos + 3 <= list_end && pos + 3 <= len)
             {
-                uint8_t nameType = data[pos++];
-                uint16_t nameLen = (data[pos] << 8) | data[pos + 1];
+                uint8_t name_type = data[pos++];
+                uint16_t name_len = (data[pos] << 8) | (data[pos + 1]);
                 pos += 2;
-                if (nameType == 0)
-                {
-                    if (pos + nameLen > len)
-                        return false;
-                    sni.assign((const char *)(data + pos), nameLen);
-                    return true;
-                }
-                pos += nameLen;
+                if (pos + name_len > len)
+                    return "";
+                return string((char *)(data + pos), name_len);
             }
-            return false;
         }
-        pos += extSize;
+        pos += ext_len;
     }
-    return false;
+    return "";
 }
 
 int main(int argc, char *argv[])
@@ -196,175 +195,176 @@ int main(int argc, char *argv[])
         return -1;
     }
     const char *dev = argv[1];
-    const std::string target = argv[2];
+    const string target_sni = argv[2];
     char errbuf[PCAP_ERRBUF_SIZE];
 
-    // open pcap handle
-    pcap_t *handle = pcap_open_live(dev, BUFSIZ, 1, 1000, errbuf);
+    // 1) pcap 열기
+    pcap_t *handle = pcap_open_live(dev, BUFSIZ, 1, 1, errbuf);
     if (!handle)
     {
-        fprintf(stderr, "couldn't open device %s: %s\n", dev, errbuf);
+        fprintf(stderr, "pcap_open_live(%s) failed: %s\n", dev, errbuf);
         return -1;
     }
-
-    // install BPF filter for TCP dst port 443
-    struct bpf_program fp;
-    if (pcap_compile(handle, &fp, "tcp dst port 443", 1, PCAP_NETMASK_UNKNOWN) < 0)
-    {
-        fprintf(stderr, "pcap_compile failed: %s\n", pcap_geterr(handle));
-        return -1;
-    }
-    if (pcap_setfilter(handle, &fp) < 0)
-    {
-        fprintf(stderr, "pcap_setfilter failed: %s\n", pcap_geterr(handle));
-        return -1;
-    }
-    pcap_freecode(&fp);
-
     if (getMyInfo(&MyInfo, dev) < 0)
     {
-        fprintf(stderr, "failed to get interface info for %s\n", dev);
+        fprintf(stderr, "getMyInfo(%s) failed\n", dev);
         pcap_close(handle);
         return -1;
     }
-
-    // raw socket for backward RST
-    int rsock = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
-    if (rsock < 0)
+    // 2) raw socket (IP_HDRINCL)
+    int sockfd = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
+    if (sockfd < 0)
     {
         perror("socket");
         pcap_close(handle);
         return -1;
     }
     int on = 1;
-    if (setsockopt(rsock, IPPROTO_IP, IP_HDRINCL, &on, sizeof(on)) < 0)
+    if (setsockopt(sockfd, IPPROTO_IP, IP_HDRINCL, &on, sizeof(on)) < 0)
     {
         perror("setsockopt");
-        close(rsock);
+        close(sockfd);
         pcap_close(handle);
         return -1;
     }
 
+    // 패킷 캡처 루프
     while (true)
     {
-        struct pcap_pkthdr *header;
-        const u_char *packet;
-        int res = pcap_next_ex(handle, &header, &packet);
+        struct pcap_pkthdr *hdr;
+        const u_char *pkt;
+        int res = pcap_next_ex(handle, &hdr, &pkt);
         if (res == 0)
             continue;
-        if (res == PCAP_ERROR || res == PCAP_ERROR_BREAK)
+        if (res < 0)
+        {
+            fprintf(stderr, "pcap_next_ex -> %d(%s)\n", res, pcap_geterr(handle));
             break;
+        }
 
-        PacketInfo *pi = (PacketInfo *)packet;
+        auto *pi = (PacketInfo *)pkt;
+        // Ethernet ⇒ IPv4?
         if (pi->ethHdr_.type() != EthHdr::Ip4)
             continue;
-
-        uint32_t ihl = pi->ipHdr_.hl() * 4;
+        // IP ⇒ TCP?
         if (pi->ipHdr_.p() != IpHdr::Tcp)
             continue;
-        uint32_t ipTotal = pi->ipHdr_.len();
-        uint32_t thl = pi->tcpHdr_.off() * 4;
-        uint32_t dataLen = ipTotal - ihl - thl;
-        if (dataLen == 0)
+
+        int ip_hdr_len = pi->ipHdr_.hl() * 4;
+        int tcp_hdr_len = pi->tcpHdr_.off() * 4;
+        int ip_pkt_len = pi->ipHdr_.len();
+        int tcp_data_len = ip_pkt_len - ip_hdr_len - tcp_hdr_len;
+        if (tcp_data_len <= 0)
+            continue;
+        // ClientHello는 클라이언트→서버(443) 방향
+        if (pi->tcpHdr_.dport() != 443)
             continue;
 
-        const uint8_t *payload = packet + sizeof(EthHdr) + ihl + thl;
-        // debug: check first bytes
-        // printf("[DEBUG] payload %u bytes -> first 5 bytes = %02X %02X %02X %02X %02X\n",
-        //        dataLen,
-        //        payload[0], payload[1], payload[2], payload[3], payload[4]);
-
-        std::string sni;
-        if (!parseTlsSni(payload, dataLen, sni))
+        const uint8_t *tcp_payload = pkt + sizeof(EthHdr) + ip_hdr_len + tcp_hdr_len;
+        string sni = parse_sni(tcp_payload, tcp_data_len);
+        if (sni.empty() || sni != target_sni)
             continue;
-        if (sni != target)
-            continue;
+        printf("[Matched SNI] %s\n", sni.c_str());
 
-        printf("Blocking SNI: %s\n", sni.c_str());
-
-        // --- Forward RST/ACK ---
-        PacketInfo *fpkt = (PacketInfo *)malloc(sizeof(PacketInfo));
-        memcpy(fpkt, packet, sizeof(PacketInfo));
-        fpkt->ethHdr_.smac_ = MyInfo.mac;
-        fpkt->ipHdr_.len_ = htons(ihl + thl);
-        fpkt->ipHdr_.sum_ = 0;
-        fpkt->ipHdr_.sum_ = CheckSum((uint16_t *)&fpkt->ipHdr_, sizeof(IpHdr));
-
-        uint32_t origSeq = pi->tcpHdr_.seq();
-        uint32_t newSeq = origSeq + dataLen;
-        fpkt->tcpHdr_.seq_ = htonl(newSeq);
-        fpkt->tcpHdr_.flags_ = TcpHdr::Rst | TcpHdr::Ack;
-        fpkt->tcpHdr_.off_rsvd_ = (sizeof(TcpHdr) / 4) << 4;
-        fpkt->tcpHdr_.sum_ = 0;
-
-        ChecksumHdr phdr;
-        memset(&phdr, 0, sizeof(phdr));
-        phdr.srcAddr = (uint32_t)pi->ipHdr_.sip();
-        phdr.dstAddr = (uint32_t)pi->ipHdr_.dip();
-        phdr.proto = pi->ipHdr_.p();
-        phdr.tcpLen = htons(sizeof(TcpHdr));
-
-        uint32_t csum = 0;
-        csum += CheckSum((uint16_t *)&fpkt->tcpHdr_, sizeof(TcpHdr));
-        csum += CheckSum((uint16_t *)&phdr, sizeof(phdr));
-        csum = (csum & 0xFFFF) + (csum >> 16);
-        fpkt->tcpHdr_.sum_ = (uint16_t)csum;
-
-        pcap_sendpacket(handle, (const u_char *)fpkt, sizeof(PacketInfo));
-        free(fpkt);
-
-        // --- Backward RST/ACK ---
-        struct
+        // === Forward: RST-only 패킷 전송 (pcap_sendpacket) ===
         {
-            IpHdr ip;
-            TcpHdr tcp;
-        } bpkt;
+            PacketInfo *fwd = (PacketInfo *)malloc(sizeof(PacketInfo));
+            memcpy(fwd, pkt, sizeof(PacketInfo));
+            // Ethernet
+            fwd->ethHdr_.smac_ = MyInfo.mac;
+            // IP
+            uint16_t new_ip_len = ip_hdr_len + tcp_hdr_len;
+            fwd->ipHdr_.len_ = htons(new_ip_len);
+            fwd->ipHdr_.sum_ = 0;
+            fwd->ipHdr_.sum_ = CheckSum((uint16_t *)&fwd->ipHdr_, sizeof(IpHdr));
+            // TCP
+            uint32_t orig_seq = pi->tcpHdr_.seq();
+            uint32_t new_seq = orig_seq + tcp_data_len;
+            fwd->tcpHdr_.seq_ = htonl(new_seq);
+            fwd->tcpHdr_.flags_ = TcpHdr::Rst; // RST only
+            fwd->tcpHdr_.off_rsvd_ = (sizeof(TcpHdr) / 4) << 4;
+            // TCP checksum
+            fwd->tcpHdr_.sum_ = 0;
+            ChecksumHdr ph;
+            memset(&ph, 0, sizeof(ph));
+            ph.srcAddr = (uint32_t)pi->ipHdr_.sip();
+            ph.dstAddr = (uint32_t)pi->ipHdr_.dip();
+            ph.reserved = 0;
+            ph.proto = pi->ipHdr_.p();
+            ph.tcpLen = htons(sizeof(TcpHdr));
+            uint32_t tcp_csum = 0;
+            tcp_csum += CheckSum((uint16_t *)&fwd->tcpHdr_, sizeof(TcpHdr));
+            tcp_csum += CheckSum((uint16_t *)&ph, sizeof(ph));
+            tcp_csum = (tcp_csum & 0xFFFF) + (tcp_csum >> 16);
+            fwd->tcpHdr_.sum_ = tcp_csum;
+            // 전송
+            if (pcap_sendpacket(handle, (const u_char *)fwd, sizeof(PacketInfo)) != 0)
+            {
+                fprintf(stderr, "pcap_sendpacket error: %s\n", pcap_geterr(handle));
+            }
+            free(fwd);
+        }
 
-        memcpy(&bpkt.ip, &pi->ipHdr_, sizeof(IpHdr));
-        bpkt.ip.sip_ = pi->ipHdr_.dip_;
-        bpkt.ip.dip_ = pi->ipHdr_.sip_;
-        bpkt.ip.len_ = htons(ihl + thl);
-        bpkt.ip.ttl_ = 64;
-        bpkt.ip.sum_ = 0;
-        bpkt.ip.sum_ = CheckSum((uint16_t *)&bpkt.ip, sizeof(IpHdr));
+        // === Backward: RST-only 패킷 전송 (raw socket) ===
+        {
+            // IP 헤더 및 TCP 헤더만 전송
+            struct
+            {
+                IpHdr ipHdr_;
+                TcpHdr tcpHdr_;
+            } bwd;
+            // 복사
+            memcpy(&bwd.ipHdr_, &pi->ipHdr_, sizeof(IpHdr));
+            memcpy(&bwd.tcpHdr_, &pi->tcpHdr_, sizeof(TcpHdr));
 
-        memcpy(&bpkt.tcp, &pi->tcpHdr_, sizeof(TcpHdr));
-        bpkt.tcp.sport_ = pi->tcpHdr_.dport_;
-        bpkt.tcp.dport_ = pi->tcpHdr_.sport_;
-        bpkt.tcp.seq_ = pi->tcpHdr_.ack_;
-        uint32_t newAck = origSeq + dataLen;
-        bpkt.tcp.ack_ = htonl(newAck);
-        bpkt.tcp.flags_ = TcpHdr::Rst | TcpHdr::Ack;
-        bpkt.tcp.off_rsvd_ = (sizeof(TcpHdr) / 4) << 4;
-        bpkt.tcp.sum_ = 0;
+            // IP swap & 설정
+            int new_ip_len = ip_hdr_len + tcp_hdr_len;
+            bwd.ipHdr_.len_ = htons(new_ip_len);
+            bwd.ipHdr_.ttl_ = 128;
+            std::swap(bwd.ipHdr_.sip_, bwd.ipHdr_.dip_);
+            bwd.ipHdr_.sum_ = 0;
+            bwd.ipHdr_.sum_ = CheckSum((uint16_t *)&bwd.ipHdr_, sizeof(IpHdr));
 
-        ChecksumHdr ph2;
-        memset(&ph2, 0, sizeof(ph2));
-        ph2.srcAddr = (uint32_t)bpkt.ip.sip_;
-        ph2.dstAddr = (uint32_t)bpkt.ip.dip_;
-        ph2.proto = bpkt.ip.p();
-        ph2.tcpLen = htons(sizeof(TcpHdr));
+            // TCP swap & 설정
+            bwd.tcpHdr_.sport_ = pi->tcpHdr_.dport_;
+            bwd.tcpHdr_.dport_ = pi->tcpHdr_.sport_;
+            // seq=클라이언트 ack, ack=orig_seq+data_len
+            bwd.tcpHdr_.seq_ = pi->tcpHdr_.ack_;
+            uint32_t orig_seq = pi->tcpHdr_.seq();
+            uint32_t new_ack = orig_seq + tcp_data_len;
+            bwd.tcpHdr_.ack_ = htonl(new_ack);
 
-        uint32_t c2 = 0;
-        c2 += CheckSum((uint16_t *)&bpkt.tcp, sizeof(TcpHdr));
-        c2 += CheckSum((uint16_t *)&ph2, sizeof(ph2));
-        c2 = (c2 & 0xFFFF) + (c2 >> 16);
-        bpkt.tcp.sum_ = (uint16_t)c2;
+            bwd.tcpHdr_.flags_ = TcpHdr::Rst;
+            bwd.tcpHdr_.off_rsvd_ = (sizeof(TcpHdr) / 4) << 4;
+            bwd.tcpHdr_.sum_ = 0;
+            // TCP checksum
+            ChecksumHdr ph2;
+            memset(&ph2, 0, sizeof(ph2));
+            ph2.srcAddr = (uint32_t)pi->ipHdr_.dip();
+            ph2.dstAddr = (uint32_t)pi->ipHdr_.sip();
+            ph2.reserved = 0;
+            ph2.proto = pi->ipHdr_.p();
+            ph2.tcpLen = htons(sizeof(TcpHdr));
+            uint32_t csum2 = 0;
+            csum2 += CheckSum((uint16_t *)&bwd.tcpHdr_, sizeof(TcpHdr));
+            csum2 += CheckSum((uint16_t *)&ph2, sizeof(ph2));
+            csum2 = (csum2 & 0xFFFF) + (csum2 >> 16);
+            bwd.tcpHdr_.sum_ = csum2;
 
-        struct sockaddr_in sin;
-        memset(&sin, 0, sizeof(sin));
-        sin.sin_family = AF_INET;
-        sin.sin_addr.s_addr = inet_addr(std::string(pi->ipHdr_.sip()).c_str());
-
-        sendto(rsock,
-               &bpkt.ip,
-               sizeof(IpHdr) + sizeof(TcpHdr),
-               0,
-               (struct sockaddr *)&sin,
-               sizeof(sin));
+            // 전송 대상 설정
+            struct sockaddr_in sin{};
+            sin.sin_family = AF_INET;
+            sin.sin_addr.s_addr = inet_addr(std::string(pi->ipHdr_.sip()).c_str());
+            int pkt_len = sizeof(IpHdr) + sizeof(TcpHdr);
+            if (sendto(sockfd, &bwd.ipHdr_, pkt_len, 0,
+                       (struct sockaddr *)&sin, sizeof(sin)) < 0)
+            {
+                perror("sendto");
+            }
+        }
     }
 
-    close(rsock);
+    close(sockfd);
     pcap_close(handle);
     return 0;
 }
